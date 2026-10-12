@@ -1,0 +1,105 @@
+name: Build Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: [package.json]
+
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+
+jobs:
+  release-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+    steps:
+      - name: Checkout release history
+        uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
+        with:
+          fetch-depth: 0
+      - name: Check package version change
+        id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          def decide():
+              current = json.loads(Path("package.json").read_text(encoding="utf-8"))["version"]
+              if subprocess.run(["git", "show-ref", "--verify", "--quiet", f"refs/tags/{current}"]).returncode == 0:
+                  return False, f"Version {current} already has a tag; use a new version."
+              if os.environ["EVENT_NAME"] == "workflow_dispatch":
+                  return True, "Manual release requested."
+              before = os.environ["BEFORE_SHA"]
+              if not before or set(before) == {"0"}:
+                  return False, "No previous branch revision to compare."
+              if subprocess.run(["git", "cat-file", "-e", f"{before}^{{commit}}"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+                  subprocess.run(["git", "fetch", "--no-tags", "origin", before], check=True)
+              previous = json.loads(git("show", f"{before}:package.json"))["version"]
+              if current == previous:
+                  return False, f"Package version is unchanged ({current})."
+              return True, f"Package version changed from {previous} to {current}."
+
+          should_release, reason = decide()
+          print(reason)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"should_release={str(should_release).lower()}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(reason + "\n")
+          PY
+
+  build:
+    needs: release-check
+    if: needs.release-check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
+
+      - name: Read package
+        id: package
+        run: |
+          python3 - <<'PY'
+          import json, os
+          package = json.load(open("package.json", encoding="utf-8"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"name={package['name']}\nversion={package['version']}\n")
+          PY
+
+      # The package exactly as UniVRM ships it, .meta files included (its GUIDs are what VRM assets reference).
+      - name: Create Package Zip
+        run: |
+          zip -q -r "$RUNNER_TEMP/${{ steps.package.outputs.name }}-${{ steps.package.outputs.version }}.zip" . -x ".git/*" ".github/*"
+          mv "$RUNNER_TEMP/${{ steps.package.outputs.name }}-${{ steps.package.outputs.version }}.zip" .
+          unzip -l "${{ steps.package.outputs.name }}-${{ steps.package.outputs.version }}.zip" package.json
+
+      - name: Create Tag
+        uses: rickstaa/action-create-tag@88dbf7ff6fe2405f8e8f6c6fdfd78829bc631f83
+        with:
+          tag: "${{ steps.package.outputs.version }}"
+
+      - name: Make Release
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844
+        with:
+          files: |
+            ${{ steps.package.outputs.name }}-${{ steps.package.outputs.version }}.zip
+            package.json
+          tag_name: ${{ steps.package.outputs.version }}
+          body: "UniVRM ${{ steps.package.outputs.version }} by the VRM Consortium, repackaged unchanged for the Orbiters VPM listing (MIT License). Source: https://github.com/vrm-c/UniVRM/releases/tag/v${{ steps.package.outputs.version }}"
+          fail_on_unmatched_files: true
